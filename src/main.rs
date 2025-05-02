@@ -9,8 +9,9 @@ use std::f64::consts::PI;
 
 use input::event::GestureEvent;
 use input::event::gesture::GestureSwipeEvent;
-use input::{Libinput, LibinputInterface};
+use input::{Event, Libinput, LibinputInterface};
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
+use rustix::event::{PollFd, PollFlags, poll};
 use std::fs::{File, OpenOptions};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
@@ -104,12 +105,12 @@ impl SwipeStateMachine {
         }
     }
 
-    fn begin(&mut self, begin: GestureSwipeBeginEvent) {
+    fn begin(&mut self, begin: &GestureSwipeBeginEvent) {
         self.finger_count = begin.finger_count();
         self.accumulated_swipe = SwipeVector::new();
     }
 
-    fn update(&mut self, update: GestureSwipeUpdateEvent) {
+    fn update(&mut self, update: &GestureSwipeUpdateEvent) {
         self.accumulated_swipe.add_update(&update);
     }
 
@@ -123,7 +124,7 @@ impl SwipeStateMachine {
 }
 
 fn handle_swipe_gesture(
-    gesture: GestureSwipeEvent,
+    gesture: &GestureSwipeEvent,
     state_machine: &mut SwipeStateMachine,
 ) -> Option<Swipe> {
     match gesture {
@@ -140,11 +141,47 @@ fn handle_swipe_gesture(
     }
 }
 
-fn handle_gesture(gesture: GestureEvent, state_machine: &mut SwipeStateMachine) -> Option<Swipe> {
+fn handle_gesture(gesture: &GestureEvent, state_machine: &mut SwipeStateMachine) -> Option<Swipe> {
     match gesture {
         GestureEvent::Swipe(swipe) => handle_swipe_gesture(swipe, state_machine),
         _ => None,
     }
+}
+
+fn handle(
+    event: &Event,
+    sway: &mut Sway,
+    state_machine: &mut SwipeStateMachine,
+) -> anyhow::Result<()> {
+    match event {
+        input::Event::Gesture(gesture) => {
+            if let Some(swipe) = handle_gesture(gesture, state_machine) {
+                let direction = swipe.dir;
+                let finger_count = swipe.finger_count;
+
+                let active_workspace = sway.get_active_workspace()?;
+
+                if finger_count == 3 {
+                    match direction {
+                        SwipeDir::W => {
+                            if active_workspace - 1 > 0 {
+                                sway.set_active_workspace(active_workspace - 1)?;
+                            }
+                        }
+                        SwipeDir::E => {
+                            if active_workspace + 1 <= 10 {
+                                sway.set_active_workspace(active_workspace + 1)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -155,36 +192,12 @@ fn main() -> Result<(), anyhow::Error> {
 
     input.udev_assign_seat("seat0").unwrap();
 
-    loop {
+    while poll(&mut [PollFd::new(&input, PollFlags::IN)], None).is_ok() {
         input.dispatch().unwrap();
         for event in &mut input {
-            match event {
-                input::Event::Gesture(gesture) => {
-                    if let Some(swipe) = handle_gesture(gesture, &mut state_machine) {
-                        let direction = swipe.dir;
-                        let finger_count = swipe.finger_count;
-
-                        let active_workspace = sway.get_active_workspace()?;
-
-                        if finger_count == 3 {
-                            match direction {
-                                SwipeDir::W => {
-                                    if active_workspace - 1 > 0 {
-                                        sway.set_active_workspace(active_workspace - 1)?;
-                                    }
-                                }
-                                SwipeDir::E => {
-                                    if active_workspace + 1 <= 10 {
-                                        sway.set_active_workspace(active_workspace + 1)?;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            handle(&event, &mut sway, &mut state_machine)?;
         }
     }
+
+    Ok(())
 }
